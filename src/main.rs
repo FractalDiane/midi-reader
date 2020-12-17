@@ -69,7 +69,7 @@ fn read_vlq(file: &mut File, byte_count: &mut u32) -> u32 {
 	let mut result: u32 = 0;
 	let mut buffer: u32 = 0b10000000;
 	let mut i: u8 = 0;
-	while buffer >> 7 == 1 {
+	while buffer & 0x80 != 0 {
 		buffer = file.read_u8().unwrap() as u32;
 		result |= (buffer & 0x7f) << (7 * i);
 		*byte_count += 1;
