@@ -6,14 +6,36 @@ use std::{env, io::SeekFrom};
 use std::process;
 use std::io::Seek;
 use std::fs::File;
+use std::collections::hash_map::HashMap;
+use std::fmt;
+use std::cmp::PartialEq;
 use byteorder::{BigEndian, ReadBytesExt};
 
 extern crate num;
 #[macro_use]
 extern crate num_derive;
-use num::FromPrimitive;
+use num::{FromPrimitive, cast};
 
-#[derive(FromPrimitive)]
+#[cfg(feature="midi_debug")]
+macro_rules! debug_print {
+	() => { println!() };
+    ($($arg:tt)*) => { println!($($arg)*) };
+}
+
+#[cfg(not(feature="midi_debug"))]
+macro_rules! debug_print {
+	() => { };
+    ($($arg:tt)*) => { };
+}
+
+#[derive(PartialEq)]
+enum EventClass {
+	Channel,
+	SysEx,
+	Meta,
+}
+
+#[derive(FromPrimitive, PartialEq)]
 enum ChannelEvent {
 	NoteOff = 0x8,
 	NoteOn = 0x9,
@@ -24,7 +46,7 @@ enum ChannelEvent {
 	PitchBend = 0xe,
 }
 
-#[derive(FromPrimitive)]
+#[derive(FromPrimitive, PartialEq)]
 enum MetaEvent {
 	SequenceNumber = 0x00,
 	Text = 0x01,
@@ -42,6 +64,37 @@ enum MetaEvent {
 	TimeSignature = 0x58,
 	KeySignature = 0x59,
 	SequencerMetaEvent = 0x7f,
+}
+
+
+struct Event {
+	class: EventClass,
+	delta: u32,
+	status: u8,
+	params: Vec<u8>,
+}
+
+#[derive(PartialEq, Eq, Hash/*, Clone, Copy*/)]
+struct MidiNote {
+	key: u8,
+	velocity: u8,
+	delta: u32,
+	position: u32,
+}
+
+
+struct Note {
+	key: u8,
+	velocity: u8,
+	position: u32,
+	duration: u32,
+}
+
+
+impl fmt::Display for Note {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "[Key {}, Velocity {}] {} -> {}", self.key, self.velocity, self.position, self.position + self.duration)
+	}
 }
 
 
@@ -80,61 +133,83 @@ fn read_vlq(file: &mut File, byte_count: &mut u32) -> u32 {
 }
 
 
-fn read_channel_event(event_type: u8, file: &mut File, byte_count: &mut u32) {
-	let typ: ChannelEvent = FromPrimitive::from_u8(event_type).unwrap();
+fn read_channel_event(delta: u32, status: u8, file: &mut File, byte_count: &mut u32) -> Event {
+	let typ: ChannelEvent = FromPrimitive::from_u8(high4(status)).unwrap();
+	let mut params = Vec::<u8>::new();
 	match typ {
 		ChannelEvent::NoteOff => {
 			let note = file.read_u8().unwrap();
 			let velocity = file.read_u8().unwrap();
-			println!("Note Off\nNote: {}\nVelocity: {}\n", note, velocity);
+			debug_print!("Note Off\nNote: {}\nVelocity: {}\n", note, velocity);
 			*byte_count += 2;
+
+			params.push(note);
+			params.push(velocity);
 		},
 
 		ChannelEvent::NoteOn => {
 			let note = file.read_u8().unwrap();
 			let velocity = file.read_u8().unwrap();
-			println!("Note On\nNote: {}\nVelocity: {}\n", note, velocity);
+			debug_print!("Note On\nNote: {}\nVelocity: {}\n", note, velocity);
 			*byte_count += 2;
+
+			params.push(note);
+			params.push(velocity);
 		},
 
 		ChannelEvent::NoteAftertouch => {
 			let note = file.read_u8().unwrap();
 			let pressure = file.read_u8().unwrap();
-			println!("Note Aftertouch\nNote: {}\nPressure: {}\n", note, pressure);
+			debug_print!("Note Aftertouch\nNote: {}\nPressure: {}\n", note, pressure);
 			*byte_count += 2;
+
+			params.push(note);
+			params.push(pressure);
 		},
 
 		ChannelEvent::Controller => {
 			let controller = file.read_u8().unwrap();
 			let value = file.read_u8().unwrap();
-			println!("Controller change\nController: {}\nValue: {}\n", controller, value);
+			debug_print!("Controller change\nController: {}\nValue: {}\n", controller, value);
 			*byte_count += 2;
+
+			params.push(controller);
+			params.push(value);
 		},
 
 		ChannelEvent::ProgramChange => {
 			let number = file.read_u8().unwrap();
-			println!("Program change\nProgram: {}\n", number);
+			debug_print!("Program change\nProgram: {}\n", number);
 			*byte_count += 1;
+
+			params.push(number);
 		},
 
 		ChannelEvent::ChannelAftertouch => {
 			let pressure = file.read_u8().unwrap();
-			println!("Channel aftertouch\nPressure: {}\n", pressure);
+			debug_print!("Channel aftertouch\nPressure: {}\n", pressure);
 			*byte_count += 1;
+
+			params.push(pressure);
 		},
 
 		ChannelEvent::PitchBend => {
 			let low = file.read_u8().unwrap() as u16;
 			let high = file.read_u8().unwrap() as u16;
-			println!("Pitch bend\nValue: {}\n", (high << 8) | low);
+			debug_print!("Pitch bend\nValue: {}\n", (high << 8) | low);
 			*byte_count += 2;
+
+			params.push(low as u8);
+			params.push(high as u8);
 		},
 	}
+
+	Event{class: EventClass::Channel, delta, status, params}
 }
 
 
-fn read_meta_event(event_type: u8, file: &mut File, byte_count: &mut u32) {
-	let typ: MetaEvent = FromPrimitive::from_u8(event_type).unwrap();
+fn read_meta_event(delta: u32, event_type: u8, file: &mut File, byte_count: &mut u32) -> Event {
+	//let typ: MetaEvent = FromPrimitive::from_u8(event_type).unwrap();
 	let length = file.read_u8().unwrap() as u32;
 	*byte_count += 1;
 	let mut params = Vec::<u8>::new();
@@ -143,33 +218,37 @@ fn read_meta_event(event_type: u8, file: &mut File, byte_count: &mut u32) {
 		*byte_count += 1;
 	}
 
-	println!("Type 0x{:x}", event_type);
-	println!("Length: {}", length);
-	println!("Parameters: {:?}\n", params);
+	debug_print!("Type 0x{:x}", event_type);
+	debug_print!("Length: {}", length);
+	debug_print!("Parameters: {:?}\n", params);
+
+	Event{class: EventClass::Meta, delta, status: event_type, params}
 }
 
 
-fn read_event(file: &mut File, byte_count: &mut u32, prev_status: &mut u8) {
+fn read_event(file: &mut File, byte_count: &mut u32, prev_status: &mut u8) -> Event {
 	let delta = read_vlq(file, byte_count);
-	println!("Delta {}", delta);
+	debug_print!("Delta {}", delta);
 
 	let status = file.read_u8().unwrap();
 	*byte_count += 1;
 	match status {
 		0xff => {
-			println!("Meta event");
+			debug_print!("Meta event");
 			let typ = file.read_u8().unwrap();
 			*byte_count += 1;
-			read_meta_event(typ, file, byte_count);
+			read_meta_event(delta, typ, file, byte_count)
 		},
 		0xf0 => {
-			println!("SysEx event");
+			debug_print!("SysEx event");
+			Event{class: EventClass::SysEx, delta: 0, status: 0x0, params: vec![]}
 		},
 		0xf7 => {
-			println!("SysEx event (end)");
+			debug_print!("SysEx event (end)");
+			Event{class: EventClass::SysEx, delta: 0, status: 0x0, params: vec![]}
 		},
 		_ => {
-			println!("Normal event");
+			debug_print!("Normal event");
 
 			let typ: u8;
 			let channel: u8;
@@ -188,9 +267,9 @@ fn read_event(file: &mut File, byte_count: &mut u32, prev_status: &mut u8) {
 				*prev_status = status;
 			}
 
-			println!("Type: 0x{:x}\nChannel: {}", typ, channel);
+			debug_print!("Type: 0x{:x}\nChannel: {}", typ, channel);
 
-			read_channel_event(typ, file, byte_count);
+			read_channel_event(delta, *prev_status, file, byte_count)
 		},
 	}
 }
@@ -223,9 +302,13 @@ fn main() {
 	else {
 		println!("Time division: {} frames/second\n", time & 0x7fff);
 	}
+
+	let mut notes = Vec::<Vec::<Note>>::new();
 	
 	for track in 0..tracks {
-		println!("Track {}", track);
+		//println!("Track {}", track);
+
+		notes.push(Vec::<Note>::new());
 
 		let this_chunk_id = read_string(&mut file, 4);
 		if this_chunk_id != "MTrk" {
@@ -234,12 +317,36 @@ fn main() {
 		}
 
 		let this_chunk_size = file.read_u32::<BigEndian>().unwrap();
-		println!("{} bytes\n", this_chunk_size);
+		//println!("{} bytes\n", this_chunk_size);
 
 		let mut byte_count = 0;
-		let mut status: u8 = 0x0;
+		let mut current_status: u8 = 0x0;
+		let mut total_delta: u32 = 0;
+
+		let mut ongoing_notes = HashMap::<u8, MidiNote>::new();
+
 		while byte_count < this_chunk_size {
-			read_event(&mut file, &mut byte_count, &mut status);
+			let event = read_event(&mut file, &mut byte_count, &mut current_status);
+			total_delta += event.delta;
+			if event.class == EventClass::Channel {
+				let typ: ChannelEvent = FromPrimitive::from_u8(high4(event.status)).unwrap();
+				if typ == ChannelEvent::NoteOff || (typ == ChannelEvent::NoteOn && event.params[1] == 0) {
+					if ongoing_notes.contains_key(&event.params[0]) {
+						let note = ongoing_notes.remove(&event.params[0]).unwrap();
+						notes[track as usize].push(Note{key: note.key, velocity: note.velocity, position: note.position, duration: total_delta - note.position});
+					}
+				}
+				else if typ == ChannelEvent::NoteOn {
+					let new_note = MidiNote{key: event.params[0], velocity: event.params[1], delta: event.delta, position: total_delta};
+					ongoing_notes.insert(new_note.key, new_note);
+				}
+			}
+		}
+	}
+
+	for i in 0..notes.len() {
+		for note in &notes[i] {
+			println!("Track {}: {}", i, *note);
 		}
 	}
 }
